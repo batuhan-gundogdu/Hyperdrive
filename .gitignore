@@ -1,0 +1,10 @@
+# PhysioNet data
+physionet.org/
+
+# Cache and checkpoints
+cache/
+checkpoints/
+
+# Python
+__pycache__/
+*.pyc
