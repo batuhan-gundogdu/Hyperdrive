@@ -29,6 +29,7 @@ class ECGWindowDataset(Dataset):
         entry = self.entries[idx]
         windows = load_lead_ii_windows(entry["dat_path"])
         windows = (windows - self.global_mean) / (self.global_std + 1e-8)
+        windows = np.clip(windows, -5.0, 5.0)  # Clip to ±5 std to handle corrupted recordings
 
         if self.windows_per_sample == 1:
             # Random window for training

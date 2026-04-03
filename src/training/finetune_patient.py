@@ -22,8 +22,8 @@ def finetune_for_patient(base_model, patient_dataset, device,
     model = copy.deepcopy(base_model)
     model.to(device)
 
-    # Freeze early encoder layer
-    for param in model.encoder.fc1.parameters():
+    # Freeze early encoder conv layers to preserve learned feature extraction
+    for param in model.encoder.conv.parameters():
         param.requires_grad = False
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]

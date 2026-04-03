@@ -24,10 +24,16 @@ def is_normal_report(row):
 def build_label_map():
     """Build a mapping from (subject_id, study_id) -> is_normal."""
     df = pd.read_csv(config.MEASUREMENTS_CSV)
+    # Vectorized: check if any report column starts with a normal keyword
+    report_cols = [c for c in df.columns if c.startswith("report_")]
+    is_normal = pd.Series(False, index=df.index)
+    for col in report_cols:
+        col_str = df[col].astype(str).str.strip()
+        for keyword in NORMAL_KEYWORDS:
+            is_normal = is_normal | col_str.str.startswith(keyword, na=False)
     labels = {}
-    for _, row in df.iterrows():
-        key = (int(row["subject_id"]), int(row["study_id"]))
-        labels[key] = is_normal_report(row)
+    for sid, study, normal in zip(df["subject_id"], df["study_id"], is_normal):
+        labels[(int(sid), int(study))] = bool(normal)
     return labels
 
 
@@ -36,19 +42,21 @@ def build_record_list():
     records = pd.read_csv(config.RECORD_LIST_CSV)
     labels = build_label_map()
 
+    # Vectorized: build entries using pandas operations
+    records["_key"] = list(zip(records["subject_id"].astype(int), records["study_id"].astype(int)))
+    records["is_normal"] = records["_key"].map(labels)
+    records = records.dropna(subset=["is_normal"])
+
     entries = []
-    for _, row in records.iterrows():
-        subject_id = int(row["subject_id"])
-        study_id = int(row["study_id"])
-        dat_path = f"{config.DATA_ROOT}/{row['path']}.dat"
-        is_normal = labels.get((subject_id, study_id), None)
-        if is_normal is None:
-            continue
+    for subject_id, study_id, path, ecg_time, is_normal in zip(
+        records["subject_id"], records["study_id"], records["path"],
+        records["ecg_time"], records["is_normal"]
+    ):
         entries.append({
-            "subject_id": subject_id,
-            "study_id": study_id,
-            "dat_path": dat_path,
-            "ecg_time": row["ecg_time"],
-            "is_normal": is_normal,
+            "subject_id": int(subject_id),
+            "study_id": int(study_id),
+            "dat_path": f"{config.DATA_ROOT}/{path}.dat",
+            "ecg_time": ecg_time,
+            "is_normal": bool(is_normal),
         })
     return entries

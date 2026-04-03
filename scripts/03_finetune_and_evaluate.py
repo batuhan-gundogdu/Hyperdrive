@@ -36,17 +36,18 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 base_model = VAE().to(device)
 checkpoint = torch.load(
     os.path.join(config.CHECKPOINT_DIR, "base_model.pt"),
-    map_location=device, weights_only=True,
+    map_location=device, weights_only=False,
 )
 base_model.load_state_dict(checkpoint["model_state_dict"])
 base_model.eval()
 
 # Per-patient evaluation
-all_base_labels, all_base_scores = [], []
-all_ft_labels, all_ft_scores = [], []
+all_base_labels, all_base_recon, all_base_latent, all_base_combined, all_base_elbo = [], [], [], [], []
+all_ft_labels, all_ft_recon, all_ft_latent, all_ft_combined, all_ft_elbo = [], [], [], [], []
 patient_results = []
 
-for pid in tqdm(candidates[:100], desc="Fine-tuning patients"):
+max_patients = min(200, len(candidates))
+for pid in tqdm(candidates[:max_patients], desc="Fine-tuning patients"):
     patient_entries = [e for e in test_entries if e["subject_id"] == pid]
 
     # Sort by time for temporal split
@@ -56,7 +57,8 @@ for pid in tqdm(candidates[:100], desc="Fine-tuning patients"):
     normal_entries = [e for e in patient_entries if e["is_normal"]]
     n_finetune = max(1, int(len(normal_entries) * 0.6))
     finetune_entries = normal_entries[:n_finetune]
-    eval_entries = [e for e in patient_entries if e not in finetune_entries]
+    finetune_study_ids = {e["study_id"] for e in finetune_entries}
+    eval_entries = [e for e in patient_entries if e["study_id"] not in finetune_study_ids]
 
     if len(eval_entries) == 0:
         continue
@@ -71,14 +73,20 @@ for pid in tqdm(candidates[:100], desc="Fine-tuning patients"):
     ft_results = compute_anomaly_scores(ft_model, eval_dataset, device)
 
     all_base_labels.extend(base_results["labels"])
-    all_base_scores.extend(base_results["recon_scores"])
+    all_base_recon.extend(base_results["recon_scores"])
+    all_base_latent.extend(base_results["latent_scores"])
+    all_base_combined.extend(base_results["combined_scores"])
+    all_base_elbo.extend(base_results["elbo_scores"])
     all_ft_labels.extend(ft_results["labels"])
-    all_ft_scores.extend(ft_results["recon_scores"])
+    all_ft_recon.extend(ft_results["recon_scores"])
+    all_ft_latent.extend(ft_results["latent_scores"])
+    all_ft_combined.extend(ft_results["combined_scores"])
+    all_ft_elbo.extend(ft_results["elbo_scores"])
 
     # Per-patient metrics (if patient has both classes in eval set)
     if len(set(base_results["labels"])) == 2:
-        base_m = compute_metrics(base_results["labels"], base_results["recon_scores"])
-        ft_m = compute_metrics(ft_results["labels"], ft_results["recon_scores"])
+        base_m = compute_metrics(base_results["labels"], base_results["combined_scores"])
+        ft_m = compute_metrics(ft_results["labels"], ft_results["combined_scores"])
         patient_results.append({
             "subject_id": pid,
             "base_auroc": base_m["auroc"],
@@ -95,19 +103,30 @@ print("AGGREGATE RESULTS (across all evaluated patients)")
 print("=" * 70)
 
 all_base_labels = np.array(all_base_labels)
-all_base_scores = np.array(all_base_scores)
 all_ft_labels = np.array(all_ft_labels)
-all_ft_scores = np.array(all_ft_scores)
 
-if len(set(all_base_labels)) == 2:
-    base_agg = compute_metrics(all_base_labels, all_base_scores)
-    ft_agg = compute_metrics(all_ft_labels, all_ft_scores)
-
+def print_metrics(title, base_scores, ft_scores, base_labels, ft_labels):
+    if len(set(base_labels)) < 2:
+        print(f"  {title}: Skipped (only one class)")
+        return None, None
+    base_m = compute_metrics(base_labels, np.array(base_scores))
+    ft_m = compute_metrics(ft_labels, np.array(ft_scores))
+    print(f"\n{title}:")
     print(f"{'Metric':<20} {'Base':>12} {'Fine-tuned':>12} {'Delta':>12}")
     print("-" * 60)
     for key in ["auroc", "auprc", "best_f1", "precision", "recall"]:
-        delta = ft_agg[key] - base_agg[key]
-        print(f"{key:<20} {base_agg[key]:>12.4f} {ft_agg[key]:>12.4f} {delta:>+12.4f}")
+        delta = ft_m[key] - base_m[key]
+        print(f"{key:<20} {base_m[key]:>12.4f} {ft_m[key]:>12.4f} {delta:>+12.4f}")
+    return base_m, ft_m
+
+base_recon_m, ft_recon_m = print_metrics("Reconstruction Score",
+    all_base_recon, all_ft_recon, all_base_labels, all_ft_labels)
+base_latent_m, ft_latent_m = print_metrics("Latent Score",
+    all_base_latent, all_ft_latent, all_base_labels, all_ft_labels)
+base_combined_m, ft_combined_m = print_metrics("Combined Score (recon + 0.1*latent)",
+    all_base_combined, all_ft_combined, all_base_labels, all_ft_labels)
+base_elbo_m, ft_elbo_m = print_metrics("ELBO Score (recon + KL per sample)",
+    all_base_elbo, all_ft_elbo, all_base_labels, all_ft_labels)
 
 if patient_results:
     improved = sum(1 for r in patient_results if r["ft_auroc"] > r["base_auroc"])
@@ -115,4 +134,23 @@ if patient_results:
           f"({100*improved/len(patient_results):.1f}%)")
     mean_base = np.mean([r["base_auroc"] for r in patient_results])
     mean_ft = np.mean([r["ft_auroc"] for r in patient_results])
-    print(f"Mean AUROC: base={mean_base:.4f}, fine-tuned={mean_ft:.4f}")
+    print(f"Mean AUROC (combined): base={mean_base:.4f}, fine-tuned={mean_ft:.4f}")
+
+# Save results
+results_data = {
+    "base_recon": base_recon_m,
+    "ft_recon": ft_recon_m,
+    "base_latent": base_latent_m,
+    "ft_latent": ft_latent_m,
+    "base_combined": base_combined_m,
+    "ft_combined": ft_combined_m,
+    "base_elbo": base_elbo_m,
+    "ft_elbo": ft_elbo_m,
+    "patient_results": patient_results,
+    "n_candidates": len(candidates),
+    "n_evaluated": max_patients,
+}
+results_path = os.path.join(config.CHECKPOINT_DIR, "eval_results.pkl")
+with open(results_path, "wb") as f:
+    pickle.dump(results_data, f)
+print(f"\nResults saved to {results_path}")

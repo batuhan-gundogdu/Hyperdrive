@@ -21,18 +21,18 @@ ADC_GAIN = 200.0
 
 # Model parameters
 INPUT_DIM = 250
-HIDDEN_DIM = 256
-LATENT_DIM = 32
+LATENT_DIM = 16
 
 # Training parameters
 BATCH_SIZE = 512
-LR_BASE = 1e-3
-LR_FINETUNE = 1e-4
-EPOCHS_BASE = 50
+LR_BASE = 3e-4
+LR_FINETUNE = 5e-5
+EPOCHS_BASE = 80
 EPOCHS_FINETUNE = 20
-KL_WEIGHT = 1.0
+KL_WEIGHT = 0.2
 WEIGHT_DECAY = 1e-5
-PATIENCE = 7  # early stopping patience
+PATIENCE = 10  # early stopping patience
+KL_ANNEAL_EPOCHS = 10  # linearly ramp KL weight over this many epochs
 
 # Per-patient fine-tuning
 MIN_RECORDINGS_FOR_FINETUNE = 5
