@@ -22,6 +22,10 @@ ADC_GAIN = 200.0
 # Model parameters
 INPUT_DIM = 250
 LATENT_DIM = 16
+FRAME_SIZE = 25       # samples per frame (10 frames per window)
+FEATURE_DIM = 256     # feature dim for TDNN layers (max hardware I/O)
+ENCODER_BLOCKS = 5    # number of TDNN blocks in encoder
+DECODER_BLOCKS = 5    # number of TDNN blocks in decoder
 
 # Training parameters
 BATCH_SIZE = 512
@@ -33,6 +37,15 @@ KL_WEIGHT = 0.2
 WEIGHT_DECAY = 1e-5
 PATIENCE = 10  # early stopping patience
 KL_ANNEAL_EPOCHS = 10  # linearly ramp KL weight over this many epochs
+
+# VQ-VAE parameters
+NUM_CODES = 8          # total codebook entries
+NORMAL_CODE_IDS = [0]  # which code indices are "normal"
+EMBED_DIM = 128        # codebook embedding dimension
+COMMITMENT_COST = 1.0  # weight for commitment loss
+CODEBOOK_COST = 1.0    # weight for codebook loss
+CLS_WEIGHT = 0.5       # max classification loss weight
+CLS_ANNEAL_EPOCHS = 20 # ramp cls_weight from 0 to CLS_WEIGHT over this many epochs
 
 # Per-patient fine-tuning
 MIN_RECORDINGS_FOR_FINETUNE = 5

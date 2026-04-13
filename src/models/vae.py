@@ -1,112 +1,202 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import config
 
 
-class ResBlock1d(nn.Module):
-    """Residual block for 1D convolutions."""
-    def __init__(self, channels, kernel_size=3, dropout=0.1):
+class FactoredTDNNLayer(nn.Module):
+    """Time Delay Neural Network layer using factored linear projections.
+
+    Equivalent to a 1D convolution with kernel_size=3, but implemented as
+    three separate Linear(dim, dim) projections (left/center/right context)
+    whose outputs are summed. This keeps every matmul at dim x dim (square),
+    fitting the hardware constraint of max 256 I/O.
+
+    Uses pre-norm residual connection for stable deep stacking.
+    """
+    def __init__(self, dim, dropout=0.1):
         super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv1d(channels, channels, kernel_size, padding=kernel_size // 2),
-            nn.BatchNorm1d(channels),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(dropout),
-            nn.Conv1d(channels, channels, kernel_size, padding=kernel_size // 2),
-            nn.BatchNorm1d(channels),
-        )
-        self.act = nn.LeakyReLU(0.2)
+        self.norm = nn.LayerNorm(dim)
+        self.proj_left = nn.Linear(dim, dim)
+        self.proj_center = nn.Linear(dim, dim)
+        self.proj_right = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        return self.act(x + self.block(x))
+        # x: (B, T, D)
+        residual = x
+        x = self.norm(x)
+
+        # Shift for left context (frame t-1) — pad a zero frame at the start
+        left = F.pad(x[:, :-1, :], (0, 0, 1, 0))
+        # Shift for right context (frame t+1) — pad a zero frame at the end
+        right = F.pad(x[:, 1:, :], (0, 0, 0, 1))
+
+        out = self.proj_left(left) + self.proj_center(x) + self.proj_right(right)
+        out = F.leaky_relu(out, 0.2)
+        out = self.dropout(out)
+        return out + residual
+
+
+class PointwiseFFN(nn.Module):
+    """Pointwise feedforward: Linear(dim, dim) with pre-norm residual.
+
+    Square matmul that adds per-frame capacity between TDNN layers.
+    """
+    def __init__(self, dim, dropout=0.1):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.fc = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        residual = x
+        x = self.norm(x)
+        x = self.fc(x)
+        x = F.leaky_relu(x, 0.2)
+        x = self.dropout(x)
+        return x + residual
+
+
+class TDNNBlock(nn.Module):
+    """One TDNN layer followed by a pointwise FFN, both with residuals."""
+    def __init__(self, dim, dropout=0.1):
+        super().__init__()
+        self.tdnn = FactoredTDNNLayer(dim, dropout)
+        self.ffn = PointwiseFFN(dim, dropout)
+
+    def forward(self, x):
+        x = self.tdnn(x)
+        x = self.ffn(x)
+        return x
 
 
 class Encoder(nn.Module):
-    """1D-CNN encoder with residual blocks.
+    """TDNN encoder for VAE.
 
-    Input: (B, 250) -> reshape to (B, 1, 250)
-    Conv layers: 250 -> 125 -> 63 -> 32
-    Residual blocks after each downsampling for better feature extraction.
-    Then flatten + FC to get mu and logvar.
+    Splits input into frames, projects to feature dim, processes with
+    stacked TDNN blocks, then pools and projects to latent space.
+
+    All Linear layers are either square (dim x dim) or smaller than 256 I/O.
     """
-    def __init__(self, latent_dim=config.LATENT_DIM):
+    def __init__(self, input_dim=config.INPUT_DIM, latent_dim=config.LATENT_DIM,
+                 frame_size=config.FRAME_SIZE, feature_dim=config.FEATURE_DIM,
+                 n_blocks=config.ENCODER_BLOCKS, dropout=0.1):
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv1d(1, 32, kernel_size=7, stride=2, padding=3),   # 250 -> 125
-            nn.BatchNorm1d(32),
-            nn.LeakyReLU(0.2),
-            ResBlock1d(32, dropout=0.1),
-            nn.Conv1d(32, 64, kernel_size=5, stride=2, padding=2),  # 125 -> 63
-            nn.BatchNorm1d(64),
-            nn.LeakyReLU(0.2),
-            ResBlock1d(64, dropout=0.1),
-            nn.Conv1d(64, 128, kernel_size=3, stride=2, padding=1), # 63 -> 32
-            nn.BatchNorm1d(128),
-            nn.LeakyReLU(0.2),
-            ResBlock1d(128, dropout=0.1),
-        )
-        # 128 * 32 = 4096
-        self.fc = nn.Sequential(
-            nn.Linear(128 * 32, 256),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(0.1),
-        )
-        self.fc_mu = nn.Linear(256, latent_dim)
-        self.fc_logvar = nn.Linear(256, latent_dim)
+        self.frame_size = frame_size
+        self.n_frames = input_dim // frame_size
+
+        # Frame embedding: Linear(frame_size, feature_dim)
+        self.frame_embed = nn.Linear(frame_size, feature_dim)
+        self.embed_norm = nn.LayerNorm(feature_dim)
+
+        # Stacked TDNN blocks
+        self.blocks = nn.ModuleList([
+            TDNNBlock(feature_dim, dropout) for _ in range(n_blocks)
+        ])
+
+        # Final projection to latent space
+        self.final_norm = nn.LayerNorm(feature_dim)
+        self.fc_pre = nn.Linear(feature_dim, feature_dim)  # square
+        self.fc_pre_norm = nn.LayerNorm(feature_dim)
+        self.fc_mu = nn.Linear(feature_dim, latent_dim)
+        self.fc_logvar = nn.Linear(feature_dim, latent_dim)
 
     def forward(self, x):
-        # x: (B, 250) -> (B, 1, 250)
-        h = x.unsqueeze(1)
-        h = self.conv(h)
-        h = h.flatten(1)  # (B, 4096)
-        h = self.fc(h)
-        mu = self.fc_mu(h)
-        logvar = self.fc_logvar(h)
+        # x: (B, 250)
+        B = x.shape[0]
+
+        # Split into frames: (B, 250) -> (B, 10, 25)
+        x = x.view(B, self.n_frames, self.frame_size)
+
+        # Frame embedding: (B, 10, 25) -> (B, 10, feature_dim)
+        x = self.frame_embed(x)
+        x = self.embed_norm(x)
+        x = F.leaky_relu(x, 0.2)
+
+        # TDNN blocks
+        for block in self.blocks:
+            x = block(x)
+
+        # Global average pool over frames: (B, 10, D) -> (B, D)
+        x = self.final_norm(x)
+        x = x.mean(dim=1)
+
+        # Project to latent
+        x = self.fc_pre(x)
+        x = self.fc_pre_norm(x)
+        x = F.leaky_relu(x, 0.2)
+
+        mu = self.fc_mu(x)
+        logvar = self.fc_logvar(x)
         logvar = torch.clamp(logvar, min=-10.0, max=10.0)
         return mu, logvar
 
 
 class Decoder(nn.Module):
-    """1D-CNN decoder with residual blocks.
+    """TDNN decoder for VAE.
 
-    Mirrors the encoder: FC -> reshape -> ConvTranspose1d layers.
-    32 -> 63 -> 125 -> 250
+    Projects latent code to feature dim, broadcasts to all frame positions
+    with learned positional embedding, refines with TDNN blocks, then
+    decodes each frame back to samples.
     """
-    def __init__(self, latent_dim=config.LATENT_DIM):
+    def __init__(self, input_dim=config.INPUT_DIM, latent_dim=config.LATENT_DIM,
+                 frame_size=config.FRAME_SIZE, feature_dim=config.FEATURE_DIM,
+                 n_blocks=config.DECODER_BLOCKS, dropout=0.1):
         super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(latent_dim, 256),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(0.1),
-            nn.Linear(256, 128 * 32),
-            nn.LeakyReLU(0.2),
-        )
-        self.deconv = nn.Sequential(
-            ResBlock1d(128, dropout=0.1),
-            nn.ConvTranspose1d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=0),  # 32 -> 63
-            nn.BatchNorm1d(64),
-            nn.LeakyReLU(0.2),
-            ResBlock1d(64, dropout=0.1),
-            nn.ConvTranspose1d(64, 32, kernel_size=5, stride=2, padding=2, output_padding=0),   # 63 -> 125
-            nn.BatchNorm1d(32),
-            nn.LeakyReLU(0.2),
-            ResBlock1d(32, dropout=0.1),
-            nn.ConvTranspose1d(32, 1, kernel_size=7, stride=2, padding=3, output_padding=1),    # 125 -> 250
-        )
+        self.frame_size = frame_size
+        self.n_frames = input_dim // frame_size
+
+        # Latent to feature dim
+        self.fc_in = nn.Linear(latent_dim, feature_dim)
+        self.fc_in_norm = nn.LayerNorm(feature_dim)
+        self.fc_expand = nn.Linear(feature_dim, feature_dim)  # square
+        self.fc_expand_norm = nn.LayerNorm(feature_dim)
+
+        # Learned positional embedding for frame positions
+        self.pos_embed = nn.Parameter(torch.randn(1, self.n_frames, feature_dim) * 0.02)
+
+        # Stacked TDNN blocks
+        self.blocks = nn.ModuleList([
+            TDNNBlock(feature_dim, dropout) for _ in range(n_blocks)
+        ])
+
+        # Frame decode: feature_dim -> frame_size per frame
+        self.final_norm = nn.LayerNorm(feature_dim)
+        self.frame_decode = nn.Linear(feature_dim, frame_size)
 
     def forward(self, z):
-        h = self.fc(z)
-        h = h.view(-1, 128, 32)
-        h = self.deconv(h)
-        return h.squeeze(1)  # (B, 250)
+        # z: (B, latent_dim)
+        x = self.fc_in(z)
+        x = self.fc_in_norm(x)
+        x = F.leaky_relu(x, 0.2)
+
+        x = self.fc_expand(x)
+        x = self.fc_expand_norm(x)
+        x = F.leaky_relu(x, 0.2)
+
+        # Broadcast to all frame positions: (B, D) -> (B, n_frames, D)
+        x = x.unsqueeze(1).expand(-1, self.n_frames, -1)
+        x = x + self.pos_embed
+
+        # TDNN blocks
+        for block in self.blocks:
+            x = block(x)
+
+        # Decode frames: (B, n_frames, D) -> (B, n_frames, frame_size)
+        x = self.final_norm(x)
+        x = self.frame_decode(x)
+
+        # Reshape: (B, n_frames, frame_size) -> (B, input_dim)
+        return x.reshape(x.shape[0], -1)
 
 
 class VAE(nn.Module):
     def __init__(self, latent_dim=config.LATENT_DIM):
         super().__init__()
-        self.encoder = Encoder(latent_dim)
-        self.decoder = Decoder(latent_dim)
+        self.encoder = Encoder(latent_dim=latent_dim)
+        self.decoder = Decoder(latent_dim=latent_dim)
 
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)

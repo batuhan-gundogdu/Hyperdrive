@@ -67,3 +67,81 @@ def compute_anomaly_scores(model, dataset, device, batch_size=512):
         results[key] = np.array(results[key])
 
     return results
+
+
+@torch.no_grad()
+def compute_vqvae_anomaly_scores(model, dataset, device):
+    """
+    Compute per-recording anomaly scores for VQ-VAE.
+
+    Scoring methods:
+    1. Codebook distance: distance to normal code minus distance to nearest abnormal code
+    2. Reconstruction error (MSE)
+    3. Combined: recon + codebook distance signal
+    """
+    dataset.windows_per_sample = 10
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4)
+
+    model.eval()
+    normal_ids = model.vq.normal_code_ids
+
+    results = {
+        "subject_ids": [],
+        "study_ids": [],
+        "labels": [],
+        "recon_scores": [],
+        "codebook_scores": [],
+        "combined_scores": [],
+        "code_abnormal_frac": [],
+    }
+
+    for batch in loader:
+        x = batch["signal"].squeeze(0).to(device)  # (10, 250)
+
+        z_e = model.encoder(x)  # (10, embed_dim)
+        x_recon, indices = model.reconstruct(x)
+
+        # Per-window reconstruction error
+        recon_per_window = F.mse_loss(x_recon, x, reduction="none").mean(dim=1)  # (10,)
+
+        # Per-window codebook distance score:
+        # distance_to_normal - distance_to_nearest_abnormal
+        # Positive = closer to abnormal, Negative = closer to normal
+        distances = torch.cdist(
+            z_e.unsqueeze(1), model.vq.codebook.weight.unsqueeze(0)
+        ).squeeze(1)  # (10, K)
+
+        normal_mask = torch.tensor(
+            [i in normal_ids for i in range(model.vq.num_codes)],
+            device=device,
+        )
+        abnormal_mask = ~normal_mask
+
+        dist_to_normal = distances[:, normal_mask].min(dim=1).values     # (10,)
+        dist_to_abnormal = distances[:, abnormal_mask].min(dim=1).values  # (10,)
+        codebook_per_window = dist_to_normal - dist_to_abnormal           # (10,)
+
+        # Fraction of windows assigned to abnormal codes
+        is_abnormal_code = model.vq.get_code_type(indices).float()
+        abnormal_frac = is_abnormal_code.mean().item()
+
+        # Aggregate via 90th percentile
+        recon_score = torch.quantile(recon_per_window, 0.9).item()
+        codebook_score = torch.quantile(codebook_per_window, 0.9).item()
+        combined_score = recon_score + 0.5 * codebook_score
+
+        results["subject_ids"].append(batch["subject_id"].item())
+        results["study_ids"].append(batch["study_id"].item())
+        results["labels"].append(batch["label"].item())
+        results["recon_scores"].append(recon_score)
+        results["codebook_scores"].append(codebook_score)
+        results["combined_scores"].append(combined_score)
+        results["code_abnormal_frac"].append(abnormal_frac)
+
+    dataset.windows_per_sample = 1
+
+    for key in ["recon_scores", "codebook_scores", "combined_scores",
+                "code_abnormal_frac", "labels"]:
+        results[key] = np.array(results[key])
+
+    return results
